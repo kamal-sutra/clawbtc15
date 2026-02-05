@@ -1,0 +1,8 @@
+.env
+*.env
+.venv/
+cache/
+out/
+broadcast/
+lib/
+test/
