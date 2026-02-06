@@ -37,6 +37,7 @@ load_dotenv()
 RPC        = os.getenv("RPC")
 CONTRACT   = Web3.to_checksum_address(os.getenv("MARKET"))
 TRADER_KEY = os.getenv("TRADER_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")   # NEW
 
 w3 = Web3(Web3.HTTPProvider(RPC))
 acct = w3.eth.account.from_key(TRADER_KEY)
@@ -162,12 +163,85 @@ def coinbase_open_price(start_ts):
     return float(best[3]) if best else None
 
 
+# ============================
+# NEW: VOLATILITY
+# ============================
+
+def btc_volatility(last_prices, window=20):
+    if len(last_prices) < 2:
+        return 0
+
+    diffs = [
+        abs(last_prices[i] - last_prices[i - 1])
+        for i in range(1, len(last_prices))
+    ]
+
+    return sum(diffs[-window:]) / min(len(diffs), window)
+
+
+# ============================
+# EXISTING LOGIC (unchanged)
+# ============================
+
 def required_btc_move(seconds_left):
     if ZONE1_END < seconds_left <= ZONE1_START:
         return ZONE1_BTC_MOVE
     if ZONE2_END < seconds_left <= ZONE2_START:
         return ZONE2_BTC_MOVE
     return ZONE3_BTC_MOVE
+
+
+# ============================
+# NEW: AI DECISION
+# ============================
+
+def ai_decision(data):
+    try:
+        prompt = f"""
+You are a crypto prediction market trading agent.
+
+Market data:
+BTC open: {data['open']}
+BTC now: {data['now']}
+Move: {data['move']}
+Volatility: {data['vol']}
+Time left: {data['time']}
+YES price: {data['yes']}
+NO price: {data['no']}
+
+Respond with only one word:
+YES
+NO
+HOLD
+"""
+
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0,
+            },
+            timeout=10,
+        ).json()
+
+        # Safe extraction
+        if "choices" in res:
+            return res["choices"][0]["message"]["content"].strip().upper()
+
+        # Log API error
+        log(f"AI API error: {res}")
+        return "HOLD"
+
+    except Exception as e:
+        log(f"AI fallback: {e}")
+        return "HOLD"
 
 
 def send_tx(fn):
@@ -208,6 +282,7 @@ def run_forever():
 
     last_round = None
     btc_open = None
+    btc_prices = []   # NEW
 
     while True:
         try:
@@ -223,6 +298,7 @@ def run_forever():
                 log(f"📌 Open BTC = {btc_open:.2f}")
                 last_round = round_id
                 traded = False
+                btc_prices = []   # NEW
 
             # Round ended
             if now >= end:
@@ -236,13 +312,18 @@ def run_forever():
             no_price  = onchain_no_price()
 
             btc_now = coinbase_live_price()
+            btc_prices.append(btc_now)   # NEW
+            if len(btc_prices) > 50:
+                btc_prices.pop(0)
+
+            vol = btc_volatility(btc_prices)   # NEW
             move = btc_now - btc_open
 
             required_move = required_btc_move(seconds_left)
 
             log(
                 f"TimeLeft={seconds_left}s | YES={yes_price:.2f} NO={no_price:.2f} | "
-                f"BTC Move=${move:.2f} (need {required_move})"
+                f"BTC Move=${move:.2f} (need {required_move}) | Vol={vol:.2f}"
             )
 
             if not traded:
@@ -251,13 +332,23 @@ def run_forever():
                     time.sleep(2)
                     continue
 
-                if MIN_BET_PRICE <= no_price <= MAX_BET_PRICE:
-                    log("✅ Trigger NO Bet")
+                decision = ai_decision({   # NEW
+                    "open": btc_open,
+                    "now": btc_now,
+                    "move": move,
+                    "vol": vol,
+                    "time": seconds_left,
+                    "yes": yes_price,
+                    "no": no_price
+                })
+
+                log(f"🧠 AI Decision: {decision}")
+
+                if decision == "NO" and MIN_BET_PRICE <= no_price <= MAX_BET_PRICE:
                     buy_no(no_price)
                     traded = True
 
-                elif MIN_BET_PRICE <= yes_price <= MAX_BET_PRICE:
-                    log("✅ Trigger YES Bet")
+                elif decision == "YES" and MIN_BET_PRICE <= yes_price <= MAX_BET_PRICE:
                     buy_yes(yes_price)
                     traded = True
 
@@ -270,4 +361,3 @@ def run_forever():
 
 if __name__ == "__main__":
     run_forever()
-
